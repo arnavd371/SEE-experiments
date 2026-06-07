@@ -166,6 +166,8 @@ def run_part1(fast: bool = False, resume: bool = False) -> pd.DataFrame:
     saddles_by_fn = {}
     for fn_name in config.FUNCTION_NAMES_2D:
         saddles = find_saddles_2d(fn_name, grid_size=grid_size)
+        from src.functions.saddle_finder import cap_saddles
+        saddles = cap_saddles(saddles, config.MAX_SADDLES_PER_FUNCTION)
         if not saddles:
             # Fallback: use domain center as a nominal saddle
             domain = config.FUNCTION_DOMAINS[fn_name]

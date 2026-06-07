@@ -113,3 +113,23 @@ def find_saddles_2d(fn_name: str, grid_size: int = None) -> list:
     return [(float(np.clip(pt[0], x_lo, x_hi)),
              float(np.clip(pt[1], y_lo, y_hi)))
             for pt in unique]
+
+
+def cap_saddles(saddles: list, max_saddles: int) -> list:
+    if len(saddles) <= max_saddles:
+        return saddles
+    pts = np.array(saddles)
+    dists_to_origin = np.linalg.norm(pts, axis=1)
+    selected_idx = [int(np.argmin(dists_to_origin))]
+    while len(selected_idx) < max_saddles:
+        selected_pts = pts[selected_idx]
+        min_dists = []
+        for i, pt in enumerate(pts):
+            if i in selected_idx:
+                min_dists.append(-1)
+            else:
+                d = np.min(np.linalg.norm(selected_pts - pt, axis=1))
+                min_dists.append(d)
+        next_idx = int(np.argmax(min_dists))
+        selected_idx.append(next_idx)
+    return [saddles[i] for i in selected_idx]

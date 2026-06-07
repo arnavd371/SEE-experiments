@@ -3,7 +3,7 @@
 import torch
 
 # ── Device ────────────────────────────────────────────────────────────────────
-DEVICE = torch.device('mps') if torch.backends.mps.is_available() else torch.device('cpu')
+DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 CPU_DEVICE = torch.device('cpu')  # forced CPU for Parts 1 & 2 (joblib-safe)
 
 # ── Reproducibility ───────────────────────────────────────────────────────────
@@ -15,12 +15,13 @@ EIGEN_TOL_POS = 1e-3      # min eigenvalue > -this → confirmed local min
 HESSIAN_DIM_THRESHOLD = 20  # full Hessian for d <= this; Lanczos above
 
 # ── Part 1 — Classical 2D ─────────────────────────────────────────────────────
-N_TRIALS_PART1 = 500
-T_MAX = 2000
+N_TRIALS_PART1 = 200
+T_MAX = 1000
 PERTURBATION_STD = 0.05
 GRID_SIZE = 200
 GRAD_CANDIDATES_TOL = 0.5   # ||∇f|| < this on grid → saddle candidate
 SADDLE_DEDUP_RADIUS = 0.5
+MAX_SADDLES_PER_FUNCTION = 5
 
 FUNCTION_DOMAINS = {
     'Himmelblau':       [(-6, 6), (-6, 6)],
@@ -33,14 +34,14 @@ FUNCTION_DOMAINS = {
 FUNCTION_NAMES_2D = list(FUNCTION_DOMAINS.keys())
 
 # ── Part 2 — High-dimensional ─────────────────────────────────────────────────
-N_TRIALS_PART2 = 500
+N_TRIALS_PART2 = 200
 N_TRIALS_PART2_HIGHD = 200   # for d > 50
 T_MAX_HIGHD = 1000            # for d > 50
-DIMENSIONS = [2, 5, 10, 20, 50, 100, 200, 500]
+DIMENSIONS = [2, 10, 50, 100, 500]
 ND_FUNCTION_NAMES = ['Rastrigin-nD', 'Styblinski-nD', 'Ackley-nD', 'Synthetic-Saddle']
 
 # ── Learning rates ─────────────────────────────────────────────────────────────
-LEARNING_RATES = [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5]
+LEARNING_RATES = [0.001, 0.01, 0.05, 0.1, 0.2, 0.5]
 
 # ── Optimizers ─────────────────────────────────────────────────────────────────
 OPTIMIZER_NAMES = ['GD_fixed', 'Adam', 'AdamW', 'RMSProp', 'AdaGrad', 'SGD_mom', 'SGD_nesterov']
@@ -64,8 +65,8 @@ RELIABLE_ESCAPE_MIN = 50   # warn if fewer than this many successful escapes
 LANCZOS_K = 6
 
 # ── Part 3 — Neural network ────────────────────────────────────────────────────
-NN_RUNS = 5
-NN_STEPS = 3000
+NN_RUNS = 3
+NN_STEPS = 2000
 NN_BATCH_SIZE = 64
 NN_SUBTRIAL_N = 100
 NN_SUBTRIAL_T_MAX = 500
@@ -91,8 +92,8 @@ MLP_HIDDEN1 = 64
 MLP_HIDDEN2 = 32
 
 # ── Part 4 — LLM proxy ────────────────────────────────────────────────────────
-LLM_RUNS = 3
-LLM_STEPS = 10000
+LLM_RUNS = 2
+LLM_STEPS = 5000
 LLM_BATCH_SIZE = 32
 LLM_GRAD_CLIP = 1.0
 LLM_WARMUP_STEPS = 500

@@ -1,55 +1,49 @@
-"""
-Statistical tests: pairwise Wilcoxon signed-rank, Bonferroni, Cohen's d.
-"""
-from __future__ import annotations
+"""Pairwise optimizer comparison: Wilcoxon signed-rank + Cohen's d."""
 import numpy as np
-import pingouin
+import warnings
 
 
 def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
-    n1, n2 = len(a), len(b)
-    if n1 < 2 or n2 < 2:
-        return np.nan
-    pooled_std = np.sqrt(((n1 - 1) * np.var(a, ddof=1) + (n2 - 1) * np.var(b, ddof=1))
-                         / (n1 + n2 - 2))
-    if pooled_std == 0:
+    diff = a - b
+    sd = diff.std(ddof=1)
+    if sd == 0:
         return 0.0
-    return float((np.mean(a) - np.mean(b)) / pooled_std)
+    return float(diff.mean() / sd)
 
 
-def pairwise_wilcoxon(
-    scores_dict: dict[str, np.ndarray],   # {name: per-trial array}
-    alpha: float = 0.05,
-) -> dict[tuple[str, str], dict]:
+def pairwise_wilcoxon(scores: dict,
+                      best_name: str,
+                      n_comparisons: int | None = None) -> dict:
     """
-    Run Wilcoxon signed-rank for every ordered pair (a, b) where
-    a is the 'best' optimizer (highest mean).
-    Returns {(best_name, other_name): {p_bonf, significant, cohens_d}}.
+    scores: {optimizer_name: array of per-trial scalar values}
+    best_name: reference optimizer
+    Returns: {opt_name: {'p': bonferroni-corrected p, 'd': cohen_d}}
     """
-    names = list(scores_dict.keys())
-    means = {n: np.mean(v) for n, v in scores_dict.items()}
-    best = max(means, key=means.get)
+    try:
+        import pingouin as pg
+    except ImportError:
+        return {}
 
-    n_pairs = len(names) - 1
-    bonf_alpha = alpha / max(n_pairs, 1)
+    best_arr = np.array(scores[best_name], dtype=float)
+    n_comp = n_comparisons or (len(scores) - 1)
     results = {}
 
-    for name in names:
-        if name == best:
+    for name, arr in scores.items():
+        if name == best_name:
             continue
-        a = scores_dict[best]
-        b = scores_dict[name]
-        n = min(len(a), len(b))
+        arr = np.array(arr, dtype=float)
+        if len(arr) != len(best_arr):
+            continue
         try:
-            res = pingouin.wilcoxon(a[:n], b[:n])
-            p = float(res['p-val'].iloc[0])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res = pg.wilcoxon(best_arr, arr, alternative="two-sided")
+            p_raw = float(res["p-val"].iloc[0])
         except Exception:
-            p = np.nan
-        d = cohens_d(a[:n], b[:n])
-        results[(best, name)] = {
-            'p_bonf': p,
-            'significant': (p < bonf_alpha) if not np.isnan(p) else False,
-            'cohens_d': d,
+            p_raw = float("nan")
+        p_corr = min(1.0, p_raw * n_comp)
+        results[name] = {
+            "p": p_corr,
+            "d": cohens_d(best_arr, arr),
         }
-
     return results

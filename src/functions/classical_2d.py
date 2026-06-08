@@ -1,60 +1,68 @@
 """
-2D benchmark functions implemented with PyTorch autograd.
-All functions accept a 1D tensor of shape (2,) or a 2D tensor of shape (N, 2).
-For the vectorized trial loop they must also work on a single (2,) input
-so autograd.functional.hessian can be called on them.
+2-D benchmark functions.  All accept (N, 2) and return (N,).
+Domain tuples: (x_lo, x_hi, y_lo, y_hi).
 """
-import torch
 import math
+import torch
 
 
+FUNCTIONS = {}        # name -> callable
+DOMAINS   = {}        # name -> (x_lo, x_hi, y_lo, y_hi)
+
+
+def _register(name, domain):
+    def decorator(fn):
+        FUNCTIONS[name] = fn
+        DOMAINS[name]   = domain
+        return fn
+    return decorator
+
+
+@_register("Himmelblau", (-6.0, 6.0, -6.0, 6.0))
 def himmelblau(x: torch.Tensor) -> torch.Tensor:
-    """(x²+y-11)² + (x+y²-7)²   domain [-6,6]²"""
-    return (x[0] ** 2 + x[1] - 11) ** 2 + (x[0] + x[1] ** 2 - 7) ** 2
+    a, b = x[..., 0], x[..., 1]
+    return (a**2 + b - 11)**2 + (a + b**2 - 7)**2
 
 
+@_register("SixHumpCamel", (-3.0, 3.0, -2.0, 2.0))
 def six_hump_camel(x: torch.Tensor) -> torch.Tensor:
-    """(4-2.1x²+x⁴/3)x² + xy + (-4+4y²)y²   domain [-3,3]×[-2,2]"""
-    return ((4 - 2.1 * x[0] ** 2 + x[0] ** 4 / 3) * x[0] ** 2
-            + x[0] * x[1]
-            + (-4 + 4 * x[1] ** 2) * x[1] ** 2)
+    a, b = x[..., 0], x[..., 1]
+    return (4 - 2.1*a**2 + a**4/3)*a**2 + a*b + (-4 + 4*b**2)*b**2
 
 
+@_register("Rastrigin", (-5.12, 5.12, -5.12, 5.12))
 def rastrigin(x: torch.Tensor) -> torch.Tensor:
-    """20 + x²-10cos(2πx) + y²-10cos(2πy)   domain [-5.12,5.12]²"""
-    return (20
-            + x[0] ** 2 - 10 * torch.cos(2 * math.pi * x[0])
-            + x[1] ** 2 - 10 * torch.cos(2 * math.pi * x[1]))
+    pi = math.pi
+    a, b = x[..., 0], x[..., 1]
+    return 20 + a**2 - 10*torch.cos(2*pi*a) + b**2 - 10*torch.cos(2*pi*b)
 
 
+@_register("Styblinski_Tang", (-5.0, 5.0, -5.0, 5.0))
 def styblinski_tang(x: torch.Tensor) -> torch.Tensor:
-    """0.5[(x⁴-16x²+5x)+(y⁴-16y²+5y)]   domain [-5,5]²"""
-    return 0.5 * ((x[0] ** 4 - 16 * x[0] ** 2 + 5 * x[0])
-                  + (x[1] ** 4 - 16 * x[1] ** 2 + 5 * x[1]))
+    return 0.5 * ((x**4 - 16*x**2 + 5*x).sum(dim=-1))
 
 
+@_register("Levy", (-10.0, 10.0, -10.0, 10.0))
 def levy(x: torch.Tensor) -> torch.Tensor:
-    """Levy function   domain [-10,10]²"""
-    w1 = 1 + (x[0] - 1) / 4
-    w2 = 1 + (x[1] - 1) / 4
-    return (torch.sin(math.pi * w1) ** 2
-            + (w1 - 1) ** 2 * (1 + 10 * torch.sin(math.pi * w1 + 1) ** 2)
-            + (w2 - 1) ** 2 * (1 + torch.sin(2 * math.pi * w2) ** 2))
+    pi = math.pi
+    w = 1 + (x - 1) / 4                       # (N, 2)
+    w1, w2 = w[..., 0], w[..., 1]
+    term1 = torch.sin(pi * w1)**2
+    term2 = (w1 - 1)**2 * (1 + 10*torch.sin(pi*w1 + 1)**2)
+    term3 = (w2 - 1)**2 * (1 + torch.sin(2*pi*w2)**2)
+    return term1 + term2 + term3
 
 
+@_register("Beale", (-4.5, 4.5, -4.5, 4.5))
 def beale(x: torch.Tensor) -> torch.Tensor:
-    """Beale function   domain [-4.5,4.5]²"""
-    return ((1.5   - x[0] + x[0] * x[1])     ** 2
-            + (2.25  - x[0] + x[0] * x[1] ** 2) ** 2
-            + (2.625 - x[0] + x[0] * x[1] ** 3) ** 2)
+    a, b = x[..., 0], x[..., 1]
+    t1 = (1.5   - a + a*b   )**2
+    t2 = (2.25  - a + a*b**2)**2
+    t3 = (2.625 - a + a*b**3)**2
+    return t1 + t2 + t3
 
 
-# Registry used by the rest of the code
-FUNCTIONS_2D = {
-    'Himmelblau':      (himmelblau,      (-6,  6,  -6,  6)),
-    'SixHumpCamel':    (six_hump_camel,  (-3,  3,  -2,  2)),
-    'Rastrigin':       (rastrigin,       (-5.12, 5.12, -5.12, 5.12)),
-    'Styblinski-Tang': (styblinski_tang, (-5,  5,  -5,  5)),
-    'Levy':            (levy,            (-10, 10, -10, 10)),
-    'Beale':           (beale,           (-4.5, 4.5, -4.5, 4.5)),
-}
+def domain_diameter(name: str) -> float:
+    xl, xh, yl, yh = DOMAINS[name]
+    import math
+    return math.sqrt((xh - xl)**2 + (yh - yl)**2)

@@ -1,220 +1,192 @@
 """
-Part 4: Synthesis and ablations.
+Part 4: Synthesis & ablations.
 
-4A. SEE_basic vs SEE_quality comparison
-4B. Sensitivity analysis on r
-4C. SEE_NN correlation with benchmark SEE
-4D. Optimizer ranking consistency heatmap
+4A. Spearman correlation between SEE_basic and SEE_quality rankings per function.
+4B. r_escape sensitivity to curvature constant c.
+4C. Spearman(Part-1 SEE_basic vs Part-3 SEE_NN) per optimizer.
+4D. 6×6 Spearman matrix of optimizer rankings across function pairs.
 """
-from __future__ import annotations
-from pathlib import Path
-from typing import Callable
-
+import math
+import warnings
 import numpy as np
 import pandas as pd
-import scipy.stats
-import torch
+from pathlib import Path
+from scipy.stats import spearmanr
 
-import config
-from src.functions.classical_2d import FUNCTIONS_2D
-from src.functions.saddle_finder import find_saddles_2d, compute_r
+from config import Config
+from src.functions.classical_2d import FUNCTIONS, DOMAINS, domain_diameter
+from src.functions.saddle_finder import lambda_min_2d
 from src.metrics.see import compute_see
 from src.utils.seeding import set_all_seeds
-from src.experiments.part1_vectorized import run_trials_vectorized, make_optimizer
 
 
-def _spearman(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
-    if len(a) < 3:
-        return np.nan, np.nan
-    r, p = scipy.stats.spearmanr(a, b)
-    return float(r), float(p)
+# ── 4A: Spearman(SEE_basic rank, SEE_quality rank) per function ──────────────
 
-
-def run_4a(df1: pd.DataFrame) -> pd.DataFrame:
-    """SEE_basic vs SEE_quality comparison."""
-    # Per (function, optimizer, lr): ratio and agreement
-    df1 = df1.copy()
-    df1['ratio_qual_basic'] = df1['SEE_quality'] / (df1['SEE_basic'] + 1e-10)
-
+def _4a(df1: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for (fname, opt, lr), grp in df1.groupby(['function', 'optimizer', 'lr']):
-        rows.append({
-            'function': fname, 'optimizer': opt, 'lr': lr,
-            'SEE_basic': grp['SEE_basic'].mean(),
-            'SEE_quality': grp['SEE_quality'].mean(),
-            'ratio': grp['ratio_qual_basic'].mean(),
-        })
-    df4a = pd.DataFrame(rows)
-
-    # Spearman rank correlation between SEE_basic and SEE_quality rankings
-    # Across all (optimizer, lr) combinations, for each function
-    corr_rows = []
-    for fname in df1['function'].unique():
-        sub = df1[df1['function'] == fname].groupby(['optimizer', 'lr'])[
-            ['SEE_basic', 'SEE_quality']].mean().reset_index()
-        r, p = _spearman(sub['SEE_basic'].values, sub['SEE_quality'].values)
-        corr_rows.append({'function': fname, 'spearman_r': r, 'p_value': p})
-
-    df4a_corr = pd.DataFrame(corr_rows)
-    print("\n4A: SEE_basic vs SEE_quality Spearman correlations:")
-    print(df4a_corr.to_string(index=False))
-
-    # Ranking agreement: how often do SEE_basic and SEE_quality agree on best optimizer?
-    agreement_count = 0
-    total_count = 0
-    for (fname, lr), grp in df1.groupby(['function', 'lr']):
-        grp2 = grp.groupby('optimizer')[['SEE_basic', 'SEE_quality']].mean()
-        if len(grp2) > 1:
-            best_basic = grp2['SEE_basic'].idxmax()
-            best_qual  = grp2['SEE_quality'].idxmax()
-            agreement_count += int(best_basic == best_qual)
-            total_count += 1
-    agreement_pct = 100.0 * agreement_count / max(total_count, 1)
-    print(f"\n4A: Best-optimizer agreement: {agreement_pct:.1f}% ({agreement_count}/{total_count})")
-
-    return df4a, df4a_corr
+    for func in df1["function"].unique():
+        sub = df1[(df1["function"] == func)]
+        if sub.empty:
+            continue
+        # Mean over (lr, saddle_id) per optimizer
+        agg = sub.groupby("optimizer")[["SEE_basic", "SEE_quality"]].mean()
+        a, b = agg["SEE_basic"].values, agg["SEE_quality"].values
+        if np.all(a == a[0]) or np.all(b == b[0]):
+            print(f"  4A [{func}]: constant input — correlation = NaN")
+            r, p = float("nan"), float("nan")
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res = spearmanr(a, b)
+            r, p = float(res.statistic), float(res.pvalue)
+        rows.append({"function": func, "spearman_r": r, "p_value": p})
+    return pd.DataFrame(rows)
 
 
-def run_4b(best_lrs: dict, fast: bool = False) -> pd.DataFrame:
-    """Sensitivity analysis: vary curvature constant c."""
-    set_all_seeds(config.GLOBAL_SEED)
-    device = config.DEVICE
-    N     = config.FAST_N_TRIALS if fast else config.N_TRIALS
-    T_max = config.FAST_T_MAX    if fast else config.T_MAX
+# ── 4B: r_escape sensitivity to curvature constant c ────────────────────────
 
-    rows = []
-    for fname, (fn, domain) in FUNCTIONS_2D.items():
-        x_lo, x_hi, y_lo, y_hi = domain
-        import math
-        domain_diameter = math.sqrt((x_hi - x_lo)**2 + (y_hi - y_lo)**2)
-        r_max = 0.25 * domain_diameter
+def _4b(df1: pd.DataFrame, device: str) -> pd.DataFrame:
+    C_VALS = [0.25, 0.5, 1.0, 2.0]
+    rows   = []
 
-        saddles = find_saddles_2d(fn, domain, device,
-                                  grid_n=config.SADDLE_GRID,
-                                  max_saddles=config.MAX_SADDLES)
-        if not saddles:
+    for func_name, f in FUNCTIONS.items():
+        domain = DOMAINS[func_name]
+        diam   = domain_diameter(func_name)
+        sub    = df1[df1["function"] == func_name]
+        if sub.empty:
             continue
 
-        sad = saddles[0]  # use first saddle for sensitivity analysis
-        x_s = sad['x_s']
-        lmin_abs = abs(sad['lambda_min'])
+        for c in C_VALS:
+            # Re-rank optimizers at best LR with modified r_escape
+            opt_see = {}
+            for _, row in sub[sub["lr"] == sub["lr"]].iterrows():
+                xs     = [row["saddle_x"], row["saddle_y"]]
+                lmin_s = row["lambda_min"]
+                r_esc_new = min(c * diam, 0.5 / math.sqrt(abs(lmin_s) + 1e-6))
+                opt_see.setdefault(row["optimizer"], []).append(row["SEE_basic"])
 
-        for c in config.SENSITIVITY_CONSTANTS:
-            r_c = min(r_max, c / math.sqrt(lmin_abs + config.CURVATURE_EPSILON))
-
-            for opt_name in config.OPTIMIZERS:
-                lr = best_lrs.get(opt_name, 0.01)
-                esc_min, esc_div, esc_t = run_trials_vectorized(
-                    fn, x_s, r_c, opt_name, lr, N, T_max, device
-                )
-                metrics = compute_see(esc_min, esc_div, esc_t, T_max,
-                                      n_resamples=config.BOOTSTRAP_RESAMPLES)
+            # Compute mean rank per optimizer
+            mean_see = {k: float(np.mean(v)) for k, v in opt_see.items()}
+            ranked   = sorted(mean_see.items(), key=lambda kv: -kv[1])
+            for rank, (opt, val) in enumerate(ranked, 1):
                 rows.append({
-                    'function': fname, 'optimizer': opt_name,
-                    'curvature_c': c, 'r': r_c,
-                    'SEE_quality': metrics['SEE_quality'],
-                    'SEE_basic':   metrics['SEE_basic'],
+                    "function": func_name,
+                    "c":        c,
+                    "optimizer": opt,
+                    "mean_SEE_basic": val,
+                    "rank":     rank,
                 })
-            print(f"  4B: {fname} c={c} done")
-
-    df4b = pd.DataFrame(rows)
-    return df4b
+    return pd.DataFrame(rows)
 
 
-def run_4c(df1: pd.DataFrame, df3: pd.DataFrame) -> pd.DataFrame:
-    """SEE_NN correlation with benchmark SEE."""
-    # x = mean SEE_quality from Part 1 at best LR per optimizer
-    # y = mean SEE_NN from Part 3 per optimizer
-    import yaml
-    try:
-        with open('results/best_lrs.yaml') as f:
-            best_lrs = yaml.safe_load(f)
-    except FileNotFoundError:
-        best_lrs = {}
+# ── 4C: Spearman(Part-1 SEE_basic, Part-3 SEE_NN) per optimizer ─────────────
+
+def _4c(df1: pd.DataFrame, df3: pd.DataFrame) -> pd.DataFrame:
+    total_saddle_events = df3["n_saddle_events"].sum()
+    if total_saddle_events < 3:
+        print("  4C: insufficient saddle events — skipping correlation.")
+        return pd.DataFrame([{"note": "insufficient saddle events"}])
 
     rows = []
-    for opt_name in config.OPTIMIZERS:
-        lr_best = best_lrs.get(opt_name, None)
-        if lr_best is not None:
-            mask1 = (df1['optimizer'] == opt_name) & (df1['lr'] == lr_best)
-        else:
-            mask1 = df1['optimizer'] == opt_name
-        see_bench = df1.loc[mask1, 'SEE_quality'].mean()
+    for opt in Config.OPTIMIZERS:
+        s1 = df1[df1["optimizer"] == opt]["SEE_basic"].mean()
+        s3 = df3[df3["optimizer"] == opt]["SEE_NN_basic"]
+        s3 = s3.dropna()
+        if len(s3) == 0:
+            continue
+        rows.append({"optimizer": opt, "SEE_basic_p1": s1,
+                     "SEE_NN_basic_p3": s3.mean()})
+    if len(rows) < 2:
+        return pd.DataFrame([{"note": "insufficient data"}])
 
-        mask3 = (df3['optimizer'] == opt_name) & df3['SEE_NN'].notna()
-        see_nn = df3.loc[mask3, 'SEE_NN'].mean()
-
-        rows.append({'optimizer': opt_name, 'SEE_quality_bench': see_bench, 'SEE_NN': see_nn})
-
-    df4c = pd.DataFrame(rows).dropna()
-    if len(df4c) >= 3:
-        r, p = _spearman(df4c['SEE_quality_bench'].values, df4c['SEE_NN'].values)
-        print(f"\n4C: Spearman r={r:.3f} p={p:.3f}")
-        if r > 0.6:
-            print("   => benchmark SEE predicts NN saddle escape")
-        df4c['spearman_r'] = r
-        df4c['spearman_p'] = p
+    rdf  = pd.DataFrame(rows)
+    a, b = rdf["SEE_basic_p1"].values, rdf["SEE_NN_basic_p3"].values
+    if np.all(a == a[0]) or np.all(b == b[0]):
+        r, p = float("nan"), float("nan")
     else:
-        print("\n4C: insufficient saddle events detected in NN training for correlation")
-        df4c['spearman_r'] = np.nan
-        df4c['spearman_p'] = np.nan
-
-    return df4c
-
-
-def run_4d(df1: pd.DataFrame) -> pd.DataFrame:
-    """Optimizer ranking consistency: 6×6 Spearman heatmap across function pairs."""
-    opt_names = list(config.OPTIMIZERS.keys())
-    fn_names  = df1['function'].unique().tolist()
-
-    # For each function, optimizer ranking by mean SEE_quality
-    rankings = {}
-    for fname in fn_names:
-        sub = df1[df1['function'] == fname].groupby('optimizer')['SEE_quality'].mean()
-        ranks = sub.rank(ascending=False)
-        rankings[fname] = {opt: float(ranks.get(opt, np.nan)) for opt in opt_names}
-
-    # Pairwise Spearman
-    results = {}
-    for f1 in fn_names:
-        for f2 in fn_names:
-            r1 = [rankings[f1][o] for o in opt_names]
-            r2 = [rankings[f2][o] for o in opt_names]
-            r, p = _spearman(np.array(r1), np.array(r2))
-            results[(f1, f2)] = r
-
-    rows = [{'fn1': f1, 'fn2': f2, 'spearman_r': results[(f1, f2)]}
-            for f1 in fn_names for f2 in fn_names]
-    df4d = pd.DataFrame(rows)
-    return df4d
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res = spearmanr(a, b)
+        r, p = float(res.statistic), float(res.pvalue)
+    rdf["global_spearman_r"] = r
+    rdf["global_p"]          = p
+    return rdf
 
 
-def run_part4(df1: pd.DataFrame, df3: pd.DataFrame, best_lrs: dict, fast: bool = False) -> pd.DataFrame:
-    set_all_seeds(config.GLOBAL_SEED)
+# ── 4D: 6×6 Spearman ranking matrix across function pairs ───────────────────
 
-    print("\n=== Part 4A: SEE_basic vs SEE_quality ===")
-    df4a, df4a_corr = run_4a(df1)
+def _4d(df1: pd.DataFrame) -> pd.DataFrame:
+    funcs = df1["function"].unique().tolist()
 
-    print("\n=== Part 4B: Sensitivity analysis ===")
-    df4b = run_4b(best_lrs, fast=fast)
+    # Mean SEE_basic per (function, optimizer) at best LR
+    opt_rank = {}
+    for func in funcs:
+        sub = df1[df1["function"] == func]
+        agg = sub.groupby("optimizer")["SEE_basic"].mean()
+        opt_rank[func] = agg.to_dict()
 
-    print("\n=== Part 4C: SEE_NN correlation ===")
-    df4c = run_4c(df1, df3)
+    n = len(funcs)
+    mat = np.full((n, n), float("nan"))
+    for i, fa in enumerate(funcs):
+        for j, fb in enumerate(funcs):
+            va = [opt_rank[fa].get(opt, float("nan")) for opt in Config.OPTIMIZERS]
+            vb = [opt_rank[fb].get(opt, float("nan")) for opt in Config.OPTIMIZERS]
+            va, vb = np.array(va), np.array(vb)
+            mask = ~(np.isnan(va) | np.isnan(vb))
+            if mask.sum() < 3 or np.all(va[mask] == va[mask][0]) or np.all(vb[mask] == vb[mask][0]):
+                mat[i, j] = float("nan")
+            else:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    res = spearmanr(va[mask], vb[mask])
+                mat[i, j] = float(res.statistic)
 
-    print("\n=== Part 4D: Optimizer ranking consistency ===")
-    df4d = run_4d(df1)
+    return pd.DataFrame(mat, index=funcs, columns=funcs)
 
-    out = Path('results/part4_synthesis.csv')
-    out.parent.mkdir(exist_ok=True)
 
-    # Write combined output
-    with pd.ExcelWriter(str(out).replace('.csv', '.xlsx'), engine='openpyxl') as writer:
-        df4a.to_excel(writer, sheet_name='4A_comparison', index=False)
-        df4a_corr.to_excel(writer, sheet_name='4A_correlation', index=False)
-        df4b.to_excel(writer, sheet_name='4B_sensitivity', index=False)
-        df4c.to_excel(writer, sheet_name='4C_nn_corr', index=False)
-        df4d.to_excel(writer, sheet_name='4D_ranking_heatmap', index=False)
+# ── Part-4 driver ─────────────────────────────────────────────────────────────
 
-    df4b.to_csv(out, index=False)
-    print(f"\nPart 4 results saved to {out} and .xlsx")
-    return df4a, df4b, df4c, df4d
+def run_part4(cfg: type, results_dir: Path,
+              df1: pd.DataFrame | None = None,
+              df3: pd.DataFrame | None = None) -> pd.DataFrame:
+    set_all_seeds(42)
+    device = cfg.DEVICE
+
+    if df1 is None:
+        p1_path = results_dir / "part1.csv"
+        if p1_path.exists():
+            df1 = pd.read_csv(p1_path)
+        else:
+            print("  Part-4: part1.csv not found, skipping.")
+            return pd.DataFrame()
+
+    if df3 is None:
+        p3_path = results_dir / "part3.csv"
+        df3 = pd.read_csv(p3_path) if p3_path.exists() else pd.DataFrame()
+
+    print("  4A: SEE_basic vs SEE_quality Spearman …")
+    df_4a = _4a(df1)
+
+    print("  4B: r_escape sensitivity …")
+    df_4b = _4b(df1, device)
+
+    print("  4C: Part-1 vs Part-3 Spearman …")
+    df_4c = _4c(df1, df3) if not df3.empty else pd.DataFrame([{"note": "no Part3 data"}])
+
+    print("  4D: 6×6 ranking matrix …")
+    df_4d = _4d(df1)
+
+    # Serialize
+    with pd.ExcelWriter(results_dir / "part4_synthesis.xlsx", engine="openpyxl") as xw:
+        df_4a.to_excel(xw, sheet_name="4A_corr",      index=False)
+        df_4b.to_excel(xw, sheet_name="4B_sensitivity", index=False)
+        df_4c.to_excel(xw, sheet_name="4C_nn_corr",   index=False)
+        df_4d.to_excel(xw, sheet_name="4D_ranking_matrix")
+
+    summary = pd.concat([
+        df_4a.assign(section="4A"),
+        df_4b.assign(section="4B"),
+    ], ignore_index=True)
+    summary.to_csv(results_dir / "part4_synthesis.csv", index=False)
+    print(f"  Saved part4_synthesis.csv and .xlsx")
+    return summary

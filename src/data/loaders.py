@@ -1,44 +1,94 @@
-"""Data loaders for Part 3 NN experiments."""
-from __future__ import annotations
+"""Data loaders for Part 3 neural-network experiments."""
 import numpy as np
 import torch
+from torch.utils.data import TensorDataset, DataLoader
 from sklearn.datasets import make_moons, fetch_california_housing
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 
-def load_moons(device) -> tuple[torch.Tensor, torch.Tensor]:
-    X, y = make_moons(n_samples=2000, noise=0.15, random_state=42)
-    X_t = torch.tensor(X, dtype=torch.float32, device=device)
-    y_t = torch.tensor(y, dtype=torch.float32, device=device)
-    return X_t, y_t
+def _to_tensors(*arrs):
+    return [torch.tensor(a, dtype=torch.float32) for a in arrs]
 
 
-def load_mnist_binary(device) -> tuple[torch.Tensor, torch.Tensor]:
-    """MNIST digits 3 vs 8, 1500 samples per class, flattened."""
-    from torchvision import datasets, transforms
-    mnist = datasets.MNIST(root='/tmp/mnist_data', download=True,
-                           transform=transforms.ToTensor())
-    data = [(img.view(-1).numpy(), int(label))
-            for img, label in mnist if int(label) in (3, 8)]
-    class3 = [(x, 0.0) for x, l in data if l == 3][:1500]
-    class8 = [(x, 1.0) for x, l in data if l == 8][:1500]
-    all_data = class3 + class8
-    rng = np.random.default_rng(42)
-    perm = rng.permutation(len(all_data))
-    xs = np.stack([all_data[i][0] for i in perm])
-    ys = np.array([all_data[i][1] for i in perm])
-    X_t = torch.tensor(xs, dtype=torch.float32, device=device)
-    y_t = torch.tensor(ys, dtype=torch.float32, device=device)
-    return X_t, y_t
+def moons_loaders(seed=42, batch=64):
+    X, y = make_moons(n_samples=2000, noise=0.15, random_state=seed)
+    X = X.astype(np.float32)
+    y = y.astype(np.float32)[:, None]
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=seed)
+    ds_tr = TensorDataset(*_to_tensors(Xtr, ytr))
+    ds_te = TensorDataset(*_to_tensors(Xte, yte))
+    return (DataLoader(ds_tr, batch_size=batch, shuffle=True),
+            DataLoader(ds_te, batch_size=256),
+            2, 1, "bce")
 
 
-def load_housing(device) -> tuple[torch.Tensor, torch.Tensor]:
+def mnist_38_loaders(seed=42, batch=64):
+    try:
+        from torchvision import datasets, transforms
+        import torchvision
+    except ImportError:
+        return _fallback_mnist38(seed, batch)
+
+    transform = transforms.Compose([transforms.ToTensor(),
+                                    transforms.Lambda(lambda x: x.view(-1))])
+    try:
+        train_full = datasets.MNIST("~/.pytorch_datasets", train=True,
+                                    download=True, transform=transform)
+        test_full  = datasets.MNIST("~/.pytorch_datasets", train=False,
+                                    download=True, transform=transform)
+    except Exception:
+        return _fallback_mnist38(seed, batch)
+
+    def filter38(ds, n_per_class=1500):
+        idx3 = [i for i, (_, y) in enumerate(ds) if y == 3][:n_per_class]
+        idx8 = [i for i, (_, y) in enumerate(ds) if y == 8][:n_per_class]
+        idxs = idx3 + idx8
+        X = torch.stack([ds[i][0] for i in idxs])          # (N, 784)
+        y = torch.tensor([0.0 if ds[i][1] == 3 else 1.0 for i in idxs])[:, None]
+        return TensorDataset(X, y)
+
+    ds_tr = filter38(train_full)
+    ds_te = filter38(test_full, n_per_class=300)
+    return (DataLoader(ds_tr, batch_size=batch, shuffle=True),
+            DataLoader(ds_te, batch_size=256),
+            784, 1, "bce")
+
+
+def _fallback_mnist38(seed=42, batch=64):
+    """Synthetic fallback if MNIST unavailable."""
+    rng = np.random.RandomState(seed)
+    X = rng.randn(3000, 784).astype(np.float32)
+    y = (rng.rand(3000) > 0.5).astype(np.float32)[:, None]
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=seed)
+    ds_tr = TensorDataset(*_to_tensors(Xtr, ytr))
+    ds_te = TensorDataset(*_to_tensors(Xte, yte))
+    return DataLoader(ds_tr, batch_size=batch, shuffle=True), DataLoader(ds_te, batch_size=256), 784, 1, "bce"
+
+
+def california_loaders(seed=42, batch=64):
     data = fetch_california_housing()
-    X, y = data.data, data.target
-    sx = StandardScaler()
-    sy = MinMaxScaler()
-    X = sx.fit_transform(X).astype(np.float32)
-    y = sy.fit_transform(y.reshape(-1, 1)).ravel().astype(np.float32)
-    X_t = torch.tensor(X, dtype=torch.float32, device=device)
-    y_t = torch.tensor(y, dtype=torch.float32, device=device)
-    return X_t, y_t
+    X, y = data.data.astype(np.float32), data.target.astype(np.float32)[:, None]
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=seed)
+
+    sx = StandardScaler(); Xtr = sx.fit_transform(Xtr); Xte = sx.transform(Xte)
+    sy = MinMaxScaler();  ytr = sy.fit_transform(ytr); yte = sy.transform(yte)
+
+    ds_tr = TensorDataset(*_to_tensors(Xtr, ytr))
+    ds_te = TensorDataset(*_to_tensors(Xte, yte))
+    return (DataLoader(ds_tr, batch_size=batch, shuffle=True),
+            DataLoader(ds_te, batch_size=256),
+            8, 1, "mse")
+
+
+TASK_LOADERS = {
+    "Moons":      moons_loaders,
+    "MNIST_3v8":  mnist_38_loaders,
+    "California": california_loaders,
+}
+
+CONVERGENCE_TARGETS = {
+    "Moons":      0.05,
+    "MNIST_3v8":  0.10,
+    "California": 0.02,
+}

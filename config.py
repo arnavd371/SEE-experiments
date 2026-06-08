@@ -1,49 +1,57 @@
 import torch
 
-DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-GLOBAL_SEED = 42
+class Config:
+    # Device
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Full experiment parameters
-N_TRIALS = 500
-T_MAX = 1000
-PERTURBATION_STD = 0.05
-MAX_SADDLES = 3
-CURVATURE_CONSTANT = 0.5   # c in r = min(r_max, c / sqrt(|lambda_min| + eps))
-CURVATURE_EPSILON = 1e-6
-GRAD_TOL = 1e-4             # gradient norm threshold for local-min check
-EIGEN_TOL_MIN = 1e-3        # lambda_min threshold for true local min vs saddle
-LEARNING_RATES = [0.001, 0.01, 0.05, 0.1, 0.2, 0.5]
-BOOTSTRAP_RESAMPLES = 1000
-NN_RUNS = 3
-NN_STEPS = 2000
-NN_BATCH_SIZE = 64
-SENSITIVITY_CONSTANTS = [0.25, 0.5, 1.0, 2.0]
-DIMENSIONS = [2, 10, 50, 100, 500]
-NN_SUBTRIAL_N = 50
-NN_SUBTRIAL_T_MAX = 300
-NN_CHECK_INTERVAL = 25
-NN_GRAD_TOL = 0.05
-NN_LAMBDA_TOL = 0.01
+    # Trial parameters
+    N_TRIALS = 500
+    T_MAX = 1000
+    PERTURBATION_STD = 0.05
 
-# --fast flag overrides
-FAST_N_TRIALS = 20
-FAST_T_MAX = 100
-FAST_DIMENSIONS = [2, 10]
-FAST_NN_STEPS = 100
-FAST_NN_RUNS = 1
+    # Metric thresholds
+    GRAD_NORM_THRESH = 1e-4
+    LAMBDA_MIN_THRESH = -1e-3
 
-# Saddle-finding grid resolution
-SADDLE_GRID = 200
-SADDLE_GRAD_THRESH = 2.0
-SADDLE_DEDUP_RADIUS = 0.5
+    # Optimizer list
+    OPTIMIZERS = ["GD_fixed", "Adam", "AdamW", "RMSProp", "AdaGrad", "SGD_momentum"]
 
-# Optimizers
-OPTIMIZERS = {
-    'GD_fixed':     {'type': 'SGD',      'kwargs': {}},
-    'Adam':         {'type': 'Adam',     'kwargs': {}},
-    'AdamW':        {'type': 'AdamW',    'kwargs': {'weight_decay': 0.01}},
-    'RMSProp':      {'type': 'RMSprop', 'kwargs': {}},
-    'AdaGrad':      {'type': 'Adagrad', 'kwargs': {}},
-    'SGD_momentum': {'type': 'SGD',     'kwargs': {'momentum': 0.9}},
-}
+    # Learning rates to sweep
+    LEARNING_RATES = [0.001, 0.01, 0.05, 0.1, 0.2, 0.5]
+
+    # Bootstrap
+    N_BOOTSTRAP = 1000
+
+    # Part 2
+    DIMENSIONS = [2, 10, 50, 100, 500]
+    SADDLE_INDICES_D50 = [1, 12, 25]   # k = 1, n//4, n//2 at d=50
+    N_TRIALS_HIGHDIM_SMALL = 200        # d <= 50
+    N_TRIALS_HIGHDIM_LARGE = 100        # d > 50
+    T_MAX_HIGHDIM = 500
+    LANCZOS_K = 6                       # eigsh k parameter for d > 20
+
+    # Part 3
+    NN_STEPS = 2000
+    NN_BATCH = 64
+    NN_SEEDS = [0, 1, 2]
+    NN_GRAD_CHECK_INTERVAL = 25
+    NN_GRAD_NORM_THRESH = 0.05
+    NN_SADDLE_LAMBDA_THRESH = -0.01
+    NN_SUB_TRIALS = 50
+    NN_SUB_T_MAX = 300
+    NN_PERTURB_STD = 0.01
+
+
+def apply_fast(cfg_class):
+    cfg_class.N_TRIALS = 50
+    cfg_class.T_MAX = 300
+    cfg_class.DIMENSIONS = [2, 10]
+    cfg_class.NN_STEPS = 200
+    cfg_class.LEARNING_RATES = [0.01, 0.1]
+    cfg_class.N_BOOTSTRAP = 200
+    cfg_class.N_TRIALS_HIGHDIM_SMALL = 50
+    cfg_class.N_TRIALS_HIGHDIM_LARGE = 50
+    cfg_class.T_MAX_HIGHDIM = 200
+    cfg_class.NN_SUB_TRIALS = 10
+    cfg_class.NN_SUB_T_MAX = 100

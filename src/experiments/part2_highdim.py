@@ -1,250 +1,257 @@
-"""
-Part 2: High-dimensional scaling experiments.
-
-Uses best LR per optimizer from Part 1.
-Vectorizes all trials as (N, d) tensors.
-Uses Lanczos for d > 20 eigenvalue computation.
-"""
-from __future__ import annotations
+"""Part 2: High-dimensional scaling experiments."""
 import math
-from pathlib import Path
-from typing import Callable
-
 import numpy as np
-import pandas as pd
-import scipy.sparse.linalg
 import torch
-import yaml
+import pandas as pd
+from pathlib import Path
+from scipy.sparse.linalg import eigsh, LinearOperator
 
-import config
-from src.functions.nd_functions import rastrigin_nd, styblinski_nd, synthetic_saddle
+from config import Config
+from src.functions.nd_functions import (
+    synthetic_saddle, synthetic_saddle_lambda_min,
+    styblinski_nd, styblinski_saddle_point, STYBLT_LAMBDA_MIN,
+    domain_diameter_nd,
+)
 from src.metrics.see import compute_see
 from src.utils.seeding import set_all_seeds
-from src.utils.checkpointing import save_checkpoint, load_checkpoint
-from src.experiments.part1_vectorized import make_optimizer
+from src.experiments.part1_vectorized import BatchedOptimizer
 
 
-def _find_nd_saddle_synthetic(k: int, d: int, device):
-    """Synthetic saddle is at origin by construction. r = 0.5/sqrt(2)."""
-    x_s = np.zeros(d)
-    lambda_min = -2.0
-    r = 0.5 / math.sqrt(abs(lambda_min) + 1e-6)
-    return x_s, r, lambda_min
+# ── Lanczos lambda_min for high-d Hessians ───────────────────────────────────
 
+def _lanczos_lambda_min(f_scalar, x_pt: torch.Tensor, k_eig: int = 6) -> float:
+    """
+    Approximate lambda_min of the Hessian at x_pt via Lanczos (eigsh, k smallest).
+    f_scalar: (d,) -> scalar callable.
+    """
+    d = x_pt.numel()
+    x_pt = x_pt.detach().clone().float()
 
-def _lanczos_lambda_min(fn: Callable, x_np: np.ndarray, device, k: int = 6) -> float:
-    """Estimate smallest Hessian eigenvalue via Lanczos (matrix-free)."""
-    d = len(x_np)
-    x = torch.tensor(x_np, dtype=torch.float32, device=device, requires_grad=True)
-    v = fn(x)
-    g = torch.autograd.grad(v, x, create_graph=True)[0]
-
-    def hess_vec(vec_np):
-        vec = torch.tensor(vec_np, dtype=torch.float32, device=device)
-        hv = torch.autograd.grad(g, x, grad_outputs=vec, retain_graph=True)[0]
+    def hvp_fn(v_np: np.ndarray) -> np.ndarray:
+        v = torch.tensor(v_np, dtype=torch.float32, device=x_pt.device)
+        x = x_pt.clone().requires_grad_(True)
+        g = torch.autograd.grad(f_scalar(x), x, create_graph=True)[0]
+        hv = torch.autograd.grad((g * v).sum(), x)[0]
         return hv.detach().cpu().numpy().astype(np.float64)
 
-    lo_op = scipy.sparse.linalg.LinearOperator((d, d), matvec=hess_vec)
-    k_eff = min(k, d - 1)
-    if k_eff < 1:
-        return 0.0
+    A = LinearOperator((d, d), matvec=hvp_fn)
     try:
-        eigs = scipy.sparse.linalg.eigsh(lo_op, k=k_eff, which='SA',
-                                          return_eigenvectors=False, tol=1e-3,
-                                          maxiter=d * 10)
-        return float(eigs.min())
+        k = min(k_eig, d - 1) if d > k_eig else max(1, d - 1)
+        vals = eigsh(A, k=k, which="SA", return_eigenvectors=False,
+                     maxiter=d * 10, tol=1e-4)
+        return float(vals.min())
     except Exception:
-        return 0.0
+        return float("nan")
 
 
-def _full_lambda_min(fn: Callable, x_np: np.ndarray, device) -> float:
-    x = torch.tensor(x_np, dtype=torch.float32, device=device)
-    H = torch.autograd.functional.hessian(fn, x)
-    H_np = H.detach().cpu().numpy().reshape(len(x_np), len(x_np))
-    return float(np.linalg.eigvalsh(H_np).min())
+# ── Per-sample grad for batched nd trials ────────────────────────────────────
+
+def _batch_grads(f, x: torch.Tensor) -> torch.Tensor:
+    x_v = x.detach().clone().requires_grad_(True)
+    grads = torch.autograd.grad(f(x_v).sum(), x_v)[0].detach()
+    return torch.nan_to_num(grads, nan=0.0, posinf=1e6, neginf=-1e6)
 
 
-def compute_lambda_min(fn, x_np, device, d):
-    if d > 20:
-        return _lanczos_lambda_min(fn, x_np, device)
-    return _full_lambda_min(fn, x_np, device)
+# ── nd trial loop (vectorized) ───────────────────────────────────────────────
 
+def run_trials_nd(f, f_scalar, x_saddle: torch.Tensor,
+                  r_escape: float, r_diverge: float,
+                  optimizer_name: str, lr: float,
+                  N: int, T_MAX: int, perturbation_std: float,
+                  device: str, d: int, use_lanczos: bool,
+                  lanczos_k: int = 6):
+    x_s = x_saddle.to(device=device, dtype=torch.float32)
 
-def run_trials_nd_vectorized(
-    fn: Callable,
-    x_s: np.ndarray,
-    r: float,
-    optimizer_name: str,
-    lr: float,
-    N: int,
-    T_max: int,
-    device,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    d = len(x_s)
-    x = torch.tensor(x_s, device=device).float()
-    x = x + torch.randn(N, d, device=device) * config.PERTURBATION_STD
-    x = x.detach().requires_grad_(True)
-    x_s_t = torch.tensor(x_s, device=device).float()
+    x = (x_s.unsqueeze(0).expand(N, -1).clone()
+         + perturbation_std * torch.randn(N, d, device=device))
 
-    opt = make_optimizer(optimizer_name, [x], lr)
+    opt = BatchedOptimizer(optimizer_name, lr, N, d, device)
 
-    escaped_min = torch.zeros(N, dtype=torch.bool, device=device)
-    escaped_div = torch.zeros(N, dtype=torch.bool, device=device)
-    escape_time = torch.full((N,), T_max, dtype=torch.float, device=device)
-    active      = torch.ones(N, dtype=torch.bool, device=device)
+    escaped_ever  = torch.zeros(N, dtype=torch.bool,  device=device)
+    quality_ever  = torch.zeros(N, dtype=torch.bool,  device=device)
+    diverged_ever = torch.zeros(N, dtype=torch.bool,  device=device)
+    escape_step   = torch.zeros(N, dtype=torch.float32, device=device)
+    quality_step  = torch.zeros(N, dtype=torch.float32, device=device)
 
-    for t in range(T_max):
-        if not active.any():
-            break
-
-        opt.zero_grad()
-        vals = torch.stack([fn(x[i]) for i in range(N)])
-        vals.sum().backward()
+    for step in range(T_MAX):
+        grads = _batch_grads(f, x)
 
         with torch.no_grad():
-            dist = torch.norm(x - x_s_t, dim=1)
-            new_div = active & (dist > r)
-            escaped_div[new_div] = True
-            escape_time[new_div] = t
-            active[new_div] = False
+            dist       = (x - x_s).norm(dim=1)
+            grad_norms = grads.norm(dim=1)
 
-            grad_norm = x.grad.norm(dim=1)
-            candidates = active & (grad_norm < config.GRAD_TOL)
+            # QUALITY_MIN
+            small = (grad_norms < Config.GRAD_NORM_THRESH) & (~quality_ever)
+            if small.any():
+                for idx in small.nonzero(as_tuple=True)[0].tolist():
+                    try:
+                        if use_lanczos:
+                            lmin = _lanczos_lambda_min(
+                                lambda xp: f_scalar(xp), x[idx], lanczos_k)
+                        else:
+                            # 2-D: full Hessian
+                            xi = x[idx].clone().requires_grad_(True)
+                            val = f_scalar(xi)
+                            g = torch.autograd.grad(val, xi, create_graph=True)[0]
+                            H = torch.stack([
+                                torch.autograd.grad(g[i], xi, retain_graph=True)[0]
+                                for i in range(d)
+                            ])
+                            lmin = torch.linalg.eigvalsh(H)[0].item()
+                        if (not math.isnan(lmin)) and lmin > Config.LAMBDA_MIN_THRESH:
+                            quality_ever[idx] = True
+                            quality_step[idx] = float(step + 1)
+                    except Exception:
+                        pass
 
-        for idx in candidates.nonzero(as_tuple=True)[0]:
-            xi_np = x[idx].detach().cpu().numpy()
-            lmin = compute_lambda_min(fn, xi_np, device, d)
-            if lmin > -config.EIGEN_TOL_MIN:
-                escaped_min[idx] = True
-                escape_time[idx] = t
-                active[idx] = False
+            # ESCAPED
+            just_esc = (~escaped_ever) & (dist > r_escape)
+            if just_esc.any():
+                escaped_ever |= just_esc
+                escape_step[just_esc] = float(step + 1)
 
-        opt.step()
+            diverged_ever |= dist > r_diverge
 
-    return escaped_min.cpu().numpy(), escaped_div.cpu().numpy(), escape_time.cpu().numpy()
+        with torch.no_grad():
+            delta = opt.step(grads)
+            if optimizer_name == "AdamW":
+                x.mul_(1.0 - lr * opt.wd)
+            x.sub_(delta)
 
-
-def power_law_fit(dims: list[int], tau_vals: list[float]) -> float:
-    """Fit tau ~ d^alpha; return alpha."""
-    valid = [(d, t) for d, t in zip(dims, tau_vals)
-             if t > 0 and not np.isnan(t) and d > 0]
-    if len(valid) < 2:
-        return np.nan
-    log_d = np.log([v[0] for v in valid])
-    log_t = np.log([v[1] for v in valid])
-    alpha = np.polyfit(log_d, log_t, 1)[0]
-    return float(alpha)
+    return (
+        escaped_ever.cpu().numpy(),
+        escape_step.cpu().numpy(),
+        quality_ever.cpu().numpy(),
+        quality_step.cpu().numpy(),
+        diverged_ever.cpu().numpy(),
+    )
 
 
-def run_part2(best_lrs: dict, fast: bool = False) -> pd.DataFrame:
-    set_all_seeds(config.GLOBAL_SEED)
-    device = config.DEVICE
+# ── Compute radii for nd synthetic saddle ────────────────────────────────────
 
-    dimensions = config.FAST_DIMENSIONS if fast else config.DIMENSIONS
-    T_max = config.FAST_T_MAX if fast else config.T_MAX
-    opt_names = list(config.OPTIMIZERS.keys())
+def _radii_synthetic(d: int) -> tuple:
+    lmin   = synthetic_saddle_lambda_min()          # -2.0
+    diam   = domain_diameter_nd(d, -5.0, 5.0)
+    r_esc  = min(0.25 * diam, 0.5 / math.sqrt(abs(lmin) + 1e-6))
+    r_div  = 0.5 * diam
+    return r_esc, r_div, lmin
 
-    ckpt_path = Path('results/part2_checkpoint.pkl')
-    completed = load_checkpoint(str(ckpt_path)) or {}
-    rows = []
 
-    # Functions: Rastrigin-nD, Styblinski-nD, Synthetic (k=1, k=n//4, k=n//2)
-    def get_functions(d):
-        fns = []
-        fns.append(('Rastrigin-nD', rastrigin_nd, None))
-        fns.append(('Styblinski-nD', styblinski_nd, None))
-        for k_desc, k_fn in [('k=1', lambda d: 1),
-                              ('k=n//4', lambda d: max(1, d // 4)),
-                              ('k=n//2', lambda d: max(1, d // 2))]:
-            fns.append((f'Synthetic_{k_desc}', None, k_fn))
-        return fns
+def _radii_styblinski(d: int) -> tuple:
+    lmin   = STYBLT_LAMBDA_MIN                     # ≈ -15.85
+    diam   = domain_diameter_nd(d, -5.0, 5.0)
+    r_esc  = min(0.25 * diam, 0.5 / math.sqrt(abs(lmin) + 1e-6))
+    r_div  = 0.5 * diam
+    return r_esc, r_div, lmin
 
-    # Collect all (function, d, optimizer) for power-law fit
-    tau_by_opt_fn: dict[tuple[str, str], dict[int, float]] = {}
 
-    for d in dimensions:
-        N = config.FAST_N_TRIALS if fast else (200 if d <= 50 else 100)
-        print(f"\n=== Dimension {d} (N={N}) ===")
+# ── Part-2 driver ─────────────────────────────────────────────────────────────
 
-        fn_list = get_functions(d)
-        for fname, fn_base, k_fn in fn_list:
-            # Determine function and saddle
-            if k_fn is not None:
-                k = k_fn(d)
-                fn = synthetic_saddle(k)
-                x_s, r, lmin = _find_nd_saddle_synthetic(k, d, device)
-                saddle_index_k = k
-            else:
-                fn = fn_base
-                # For nD Rastrigin/Styblinski the origin is a saddle (gradient=0,
-                # mixed curvature at origin for Styblinski; for Rastrigin it's a
-                # local min at origin but other points are saddles — we place
-                # trials at a small perturbation of origin and use the origin).
-                # Use origin as approximate saddle; compute lambda_min.
-                x_s = np.zeros(d)
-                lmin = compute_lambda_min(fn, x_s, device, d)
-                r_max = 0.25 * math.sqrt(d * (2 * 5.12) ** 2) if 'Rastrigin' in fname \
-                    else 0.25 * math.sqrt(d * 100)
-                r = min(r_max, 0.5 / math.sqrt(abs(lmin) + 1e-6))
-                saddle_index_k = -1
+def run_part2(cfg: type, results_dir: Path,
+              best_lrs: dict | None = None) -> pd.DataFrame:
+    set_all_seeds(42)
+    device = cfg.DEVICE
+    rows   = []
 
-                # Skip if not a saddle
-                if lmin >= 0:
-                    print(f"  {fname} d={d}: origin is not a saddle (lmin={lmin:.3f}), skip")
-                    continue
+    # Load best LRs if available; else fall back to cfg.LEARNING_RATES[1]
+    if best_lrs is None:
+        import yaml
+        lr_file = results_dir / "best_lrs.yaml"
+        if lr_file.exists():
+            with open(lr_file) as fh:
+                best_lrs = yaml.safe_load(fh)
+        else:
+            best_lrs = {opt: cfg.LEARNING_RATES[len(cfg.LEARNING_RATES)//2]
+                        for opt in cfg.OPTIMIZERS}
 
-            for opt_name in opt_names:
-                lr = best_lrs.get(opt_name, 0.01)
-                key = (fname, d, opt_name, saddle_index_k)
+    saddle_indices_at50 = cfg.SADDLE_INDICES_D50   # [1, 12, 25] for d=50
 
-                if key in completed:
-                    rows.append(completed[key])
-                    tau_by_opt_fn.setdefault((opt_name, fname), {})[d] = completed[key]['tau_mean']
-                    continue
+    for d in cfg.DIMENSIONS:
+        use_lanczos = d > 20
+        N = cfg.N_TRIALS_HIGHDIM_SMALL if d <= 50 else cfg.N_TRIALS_HIGHDIM_LARGE
+        T_MAX = cfg.T_MAX_HIGHDIM
 
-                print(f"  {fname} d={d} k={saddle_index_k} {opt_name} lr={lr}", end='', flush=True)
-                esc_min, esc_div, esc_t = run_trials_nd_vectorized(
-                    fn, x_s, r, opt_name, lr, N, T_max, device
+        # Effective perturbation std — scale so L2 ≈ r_escape/2
+        r_esc_syn, _, _ = _radii_synthetic(d)
+        std_eff = min(cfg.PERTURBATION_STD, r_esc_syn / (2.0 * math.sqrt(d)))
+
+        # ── A: Synthetic saddle (vary k) ──────────────────────────────────
+        k_vals = [1, max(1, d // 4), max(1, d // 2)]
+        for k in k_vals:
+            k = min(k, d)
+            r_esc, r_div, lmin = _radii_synthetic(d)
+
+            def f_syn(x, _k=k):
+                return synthetic_saddle(x, _k)
+
+            def f_syn_scalar(x, _k=k):
+                return synthetic_saddle(x.unsqueeze(0), _k)[0]
+
+            x_sad = torch.zeros(d, dtype=torch.float32)
+
+            for opt_name in cfg.OPTIMIZERS:
+                lr = best_lrs.get(opt_name, cfg.LEARNING_RATES[1])
+                set_all_seeds(42)
+                esc, esc_s, qlt, qlt_s, div = run_trials_nd(
+                    f_syn, f_syn_scalar, x_sad, r_esc, r_div,
+                    opt_name, lr, N, T_MAX, std_eff, device, d,
+                    use_lanczos, cfg.LANCZOS_K,
                 )
-                metrics = compute_see(esc_min, esc_div, esc_t, T_max,
-                                      n_resamples=config.BOOTSTRAP_RESAMPLES)
-                print(f"  SEE_basic={metrics['SEE_basic']:.4f}")
+                esc_s_m = np.where(esc, esc_s, np.nan)
+                qlt_s_m = np.where(qlt, qlt_s, np.nan)
+                metrics = compute_see(esc, esc_s_m, qlt, qlt_s_m, div,
+                                      n_bootstrap=cfg.N_BOOTSTRAP)
+                rows.append({
+                    "function":  f"Synthetic_k{k}",
+                    "dim":       d,
+                    "k":         k,
+                    "optimizer": opt_name,
+                    "lr":        lr,
+                    "lambda_min": lmin,
+                    "r_escape":  r_esc,
+                    "r_diverge": r_div,
+                    **metrics,
+                })
 
-                row = {
-                    'function':         fname,
-                    'optimizer':        opt_name,
-                    'lr_best':          lr,
-                    'dimension':        d,
-                    'saddle_index_k':   saddle_index_k,
-                    'SEE_basic':        metrics['SEE_basic'],
-                    'SEE_quality':      metrics['SEE_quality'],
-                    'CI_lo':            metrics['SEE_basic_CI_lo'],
-                    'CI_hi':            metrics['SEE_basic_CI_hi'],
-                    'tau_mean':         metrics['tau_mean'],
-                    'tau_std':          metrics['tau_std'],
-                    'escape_min_pct':   metrics['escape_min_pct'],
-                    'stuck_pct':        metrics['stuck_pct'],
-                    'power_law_alpha':  np.nan,  # filled below
-                }
-                completed[key] = row
-                rows.append(row)
-                tau_by_opt_fn.setdefault((opt_name, fname), {})[d] = metrics['tau_mean']
+        # ── B: Styblinski-nD (one saddle per d, varying k=1 default) ──────
+        k_stb = max(1, d // 4)
+        x_sad_stb = styblinski_saddle_point(d, k_stb).float()
+        r_esc_stb, r_div_stb, lmin_stb = _radii_styblinski(d)
+        std_stb = min(cfg.PERTURBATION_STD, r_esc_stb / (2.0 * math.sqrt(d)))
 
-        save_checkpoint(completed, str(ckpt_path))
+        def f_stb(x):
+            return styblinski_nd(x)
+
+        def f_stb_scalar(x):
+            return styblinski_nd(x.unsqueeze(0))[0]
+
+        for opt_name in cfg.OPTIMIZERS:
+            lr = best_lrs.get(opt_name, cfg.LEARNING_RATES[1])
+            set_all_seeds(42)
+            esc, esc_s, qlt, qlt_s, div = run_trials_nd(
+                f_stb, f_stb_scalar, x_sad_stb, r_esc_stb, r_div_stb,
+                opt_name, lr, N, T_MAX, std_stb, device, d,
+                use_lanczos, cfg.LANCZOS_K,
+            )
+            esc_s_m = np.where(esc, esc_s, np.nan)
+            qlt_s_m = np.where(qlt, qlt_s, np.nan)
+            metrics = compute_see(esc, esc_s_m, qlt, qlt_s_m, div,
+                                  n_bootstrap=cfg.N_BOOTSTRAP)
+            rows.append({
+                "function":  "Styblinski_nD",
+                "dim":       d,
+                "k":         k_stb,
+                "optimizer": opt_name,
+                "lr":        lr,
+                "lambda_min": lmin_stb,
+                "r_escape":  r_esc_stb,
+                "r_diverge": r_div_stb,
+                **metrics,
+            })
+
+        print(f"  d={d} done.")
 
     df = pd.DataFrame(rows)
-
-    # --- Power law fit ---
-    for (opt_name, fname), dim_tau in tau_by_opt_fn.items():
-        sorted_items = sorted(dim_tau.items())
-        dims_used = [x[0] for x in sorted_items]
-        taus_used = [x[1] for x in sorted_items]
-        alpha = power_law_fit(dims_used, taus_used)
-        mask = (df['optimizer'] == opt_name) & (df['function'] == fname)
-        df.loc[mask, 'power_law_alpha'] = alpha
-
-    out = Path('results/part2.csv')
-    out.parent.mkdir(exist_ok=True)
-    df.to_csv(out, index=False)
-    print(f"\nPart 2 results saved to {out}")
+    df.to_csv(results_dir / "part2.csv", index=False)
+    print(f"  Saved part2.csv ({len(df)} rows)")
     return df

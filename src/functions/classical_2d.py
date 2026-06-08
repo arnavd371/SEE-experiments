@@ -13,9 +13,11 @@ def himmelblau(x: torch.Tensor) -> torch.Tensor:
     return (x[0] ** 2 + x[1] - 11) ** 2 + (x[0] + x[1] ** 2 - 7) ** 2
 
 
-def rosenbrock(x: torch.Tensor) -> torch.Tensor:
-    """(1-x)² + 100(y-x²)²   domain [-2,2]×[-1,3]"""
-    return (1 - x[0]) ** 2 + 100 * (x[1] - x[0] ** 2) ** 2
+def six_hump_camel(x: torch.Tensor) -> torch.Tensor:
+    """(4-2.1x²+x⁴/3)x² + xy + (-4+4y²)y²   domain [-3,3]×[-2,2]"""
+    return ((4 - 2.1 * x[0] ** 2 + x[0] ** 4 / 3) * x[0] ** 2
+            + x[0] * x[1]
+            + (-4 + 4 * x[1] ** 2) * x[1] ** 2)
 
 
 def rastrigin(x: torch.Tensor) -> torch.Tensor:
@@ -50,7 +52,7 @@ def beale(x: torch.Tensor) -> torch.Tensor:
 # Registry used by the rest of the code
 FUNCTIONS_2D = {
     'Himmelblau':      (himmelblau,      (-6,  6,  -6,  6)),
-    'Rosenbrock':      (rosenbrock,      (-2,  2,  -1,  3)),
+    'SixHumpCamel':    (six_hump_camel,  (-3,  3,  -2,  2)),
     'Rastrigin':       (rastrigin,       (-5.12, 5.12, -5.12, 5.12)),
     'Styblinski-Tang': (styblinski_tang, (-5,  5,  -5,  5)),
     'Levy':            (levy,            (-10, 10, -10, 10)),

@@ -1,0 +1,6 @@
+AdaGrad: 0.5
+Adam: 0.2
+AdamW: 0.05
+GD_fixed: 0.001
+RMSProp: 0.1
+SGD_momentum: 0.2

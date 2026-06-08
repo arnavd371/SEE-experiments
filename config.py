@@ -35,7 +35,7 @@ FAST_NN_RUNS = 1
 
 # Saddle-finding grid resolution
 SADDLE_GRID = 200
-SADDLE_GRAD_THRESH = 0.5
+SADDLE_GRAD_THRESH = 2.0
 SADDLE_DEDUP_RADIUS = 0.5
 
 # Optimizers
